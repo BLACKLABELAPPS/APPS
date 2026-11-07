@@ -1,0 +1,267 @@
+
+PROMPT MAESTRO REUTILIZABLE — INSPECCIONAR, DESCOMPRIMIR, EDITAR Y REEMPAQUETAR PROYECTOS SKETCHWARE / SKETCHWARE PRO (.SWB)
+
+OBJETIVO
+Voy a adjuntar un archivo .swb (o una copia .zip de un respaldo Sketchware) en library de chagtgpt y deacuerdo a lo que te haya pedido haz los cambios que necesito. Debes trabajar sobre ESE proyecto, descubrir su estructura real y devolver un respaldo que Sketchware Pro pueda importar. Este prompt es genérico: NO reutilices nombres de clases, IDs, métodos, claves, rutas, colores, preferencias ni datos de ningún proyecto anterior. Todo debe descubrirse de nuevo en cada archivo.
+
+REGLAS PRINCIPALES
+1. No supongas que todos los forks/versiones tienen el mismo formato interno.
+2. No confundas la compresión ZIP exterior con el formato/cifrado de los archivos internos.
+3. No inventes un algoritmo de cifrado, claves, IV, contraseñas, IDs, métodos ni rutas.
+4. No conviertas datos binarios/serializados en texto ni los sobrescribas con JSON por intuición.
+5. No reconstruyas el proyecto desde cero. Conserva los datos originales y modifica lo mínimo necesario.
+6. Mantén el archivo original intacto y trabaja en una copia.
+7. Un ZIP íntegro no demuestra por sí solo que Sketchware Pro pueda importar el proyecto; informa por separado de cada nivel de verificación.
+
+FASE 1 — IDENTIFICAR EL FORMATO ANTES DE EXTRAER
+
+1. Detecta el formato por su contenido, no solo por la extensión:
+   - Comprueba la firma inicial y usa zipfile.is_zipfile(ruta).
+   - Una firma ZIP habitual empieza por bytes PK (por ejemplo PK\x03\x04 para una entrada local).
+   - No cambies .swb a .zip como si eso convirtiera un formato desconocido en ZIP. Renombrar solo cambia la extensión.
+2. Si no es ZIP válido, no fuerces zipfile ni extraigas a ciegas. Inspecciona cabecera, tamaño y formato, y consulta el código de la versión/fork que lo creó.
+3. Si sí es ZIP, abre el directorio central y registra para CADA entrada:
+   - nombre y ruta interna exactos;
+   - tamaño descomprimido y comprimido;
+   - método de compresión;
+   - CRC;
+   - fecha, flags, atributos, comentario y campos extra;
+   - si es directorio;
+   - si el bit 0 de flag_bits indica cifrado ZIP tradicional.
+4. Ejecuta ZipFile.testzip() antes de editar. Si devuelve un nombre de entrada, el archivo tiene una entrada dañada: detente y conserva el original.
+5. Genera un inventario legible, por ejemplo CSV/JSON/TXT, y conserva la lista original de entradas y metadatos.
+
+FASE 2 — ENTENDER QUÉ SIGNIFICA LA COMPRESIÓN
+
+Un respaldo .swb de Sketchware suele ser un contenedor ZIP. La extensión .swb no define por sí sola un algoritmo de compresión distinto.
+
+En ZIP, el método se guarda por entrada. Métodos habituales:
+   - 0 = STORED: la entrada se guarda sin compresión.
+   - 8 = DEFLATED: compresión DEFLATE (formato raw DEFLATE, RFC 1951), normalmente implementada mediante zlib/Deflater.
+   - 12 = BZIP2, si la herramienta y el importador lo admiten.
+   - 14 = LZMA, si la herramienta y el importador lo admiten.
+   - Otros métodos: no los transformes hasta confirmar compatibilidad.
+
+Distingue SIEMPRE:
+   - método ZIP: por ejemplo STORED o DEFLATED;
+   - nivel de compresión: por ejemplo 0–9 para DEFLATE;
+   - cifrado: protección criptográfica, que es algo diferente de comprimir.
+
+El método 8 no significa que el contenido esté cifrado. El método 0 tampoco significa que sea texto plano.
+El nivel de compresión normalmente no se puede reconstruir con certeza mirando solo el ZIP final. Registra el nivel que tú uses al crear el resultado, pero no afirmes que conoces el nivel original si no existe evidencia.
+
+En Python:
+   zipfile.ZIP_STORED == 0
+   zipfile.ZIP_DEFLATED == 8
+   zipfile.ZIP_BZIP2 == 12
+   zipfile.ZIP_LZMA == 14
+
+Para DEFLATE, Python zipfile con zlib y ZIP_DEFLATED es adecuado cuando el importador admite ZIP estándar. Un nivel 9 busca mayor compresión y tarda más; un nivel 6/default suele equilibrar tamaño y velocidad. No cambies arbitrariamente el método de entradas del original.
+
+FASE 3 — EXTRACCIÓN SEGURA
+
+Usa Python 3 y zipfile, o una herramienta equivalente que soporte ZIP estándar. Evita extracción insegura de rutas (Zip Slip). No confíes en nombres internos que intenten salir de la carpeta de trabajo.
+
+Ejemplo seguro:
+
+```python
+from pathlib import Path
+from zipfile import ZipFile
+
+src = Path("proyecto.swb")
+out = Path("workspace_extraido").resolve()
+out.mkdir(parents=True, exist_ok=True)
+
+if not ZipFile.is_zipfile(src):
+    raise RuntimeError("El archivo no es un ZIP válido; no se debe extraer a ciegas")
+
+with ZipFile(src, "r") as zf:
+    bad = zf.testzip()
+    if bad is not None:
+        raise RuntimeError(f"Entrada ZIP dañada: {bad}")
+
+    for info in zf.infolist():
+        target = (out / info.filename).resolve()
+        if target != out and out not in target.parents:
+            raise RuntimeError(f"Ruta ZIP insegura: {info.filename}")
+        if info.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(zf.read(info))
+```
+
+No des por hecho una estructura fija. Según la versión/fork, el respaldo puede contener archivos de proyecto con nombres como `file`, `library`, `logic`, `resource`, `view`, directorios `data/...`, archivos Java/XML/JSON, recursos, bibliotecas y metadatos adicionales. Eso es una guía de reconocimiento, NO una lista obligatoria.
+
+FASE 4 — DETECTAR DATOS DE PROYECTO CIFRADOS O SERIALIZADOS
+
+Hay dos capas independientes:
+
+A) Cifrado del contenedor ZIP: comprueba `ZipInfo.flag_bits & 0x1` y el método/indicadores ZIP. No presupongas que existe.
+
+B) Cifrado o serialización de archivos internos de Sketchware: una entrada ZIP puede estar descomprimida correctamente y aun así contener bytes binarios cifrados/serializados por Sketchware. Esto NO se detecta con `flag_bits` del ZIP.
+
+Para cada archivo interno:
+   1. Identifica ruta, tamaño, firma, MIME aproximado y si contiene texto reconocible.
+   2. No declares que está cifrado solamente porque no se ve texto. Puede ser serialización binaria, protobuf, datos comprimidos internos, formato propietario o datos aleatorios.
+   3. Contrasta la estructura con el código fuente de la versión/fork que produjo el archivo.
+   4. Localiza la ruta real de exportación/importación y las funciones que serializan, deserializan, cifran y descifran. Busca en el código fuente términos como `.swb`, backup, restore, import/export, ZipInputStream, ZipOutputStream, Cipher, encrypt, decrypt, serialize, deserialize y nombres de clases de gestión de proyectos.
+   5. Comprueba versión, commit/tag y fork. No uses la implementación de una versión diferente sin validar compatibilidad.
+   6. Si hay cifrado a nivel de archivo, identifica y registra algoritmo, modo, padding, codificación, clave/derivación, IV/nonce, salt, cabecera, orden de bytes y formato de salida SOLO si el código fuente o una prueba reproducible lo demuestra.
+   7. No inventes AES, XOR, Base64, contraseñas, claves o IV. Si no se puede demostrar el algoritmo, informa que ese archivo no se puede editar con seguridad y no lo alteres.
+   8. Cuando exista una rutina oficial de descifrado/cifrado, úsala como pareja exacta: descifrar → editar el objeto/texto deserializado → serializar en el formato exacto → cifrar con la rutina correspondiente.
+   9. Mantén archivos internos no modificados exactamente iguales después de la extracción/reempaquetado a nivel de bytes descomprimidos.
+
+IMPORTANTE: fuentes comunitarias describen archivos internos protegidos y herramientas de descifrado/recifrado; otras guías describen el contenido como texto/JSON-like. Puede haber diferencias de versión, fork, tipo de proyecto o una simplificación de la documentación. Ante conflicto, manda el análisis del archivo adjunto y el código de la versión exacta. No generalices una observación de un proyecto a todos los `.swb`.
+
+FASE 5 — DESCUBRIR LA ESTRUCTURA REAL DEL PROYECTO
+
+1. Crea un árbol completo de archivos y una tabla de inventario.
+2. Clasifica las entradas: código fuente, layouts XML, recursos, cadenas, estilos, configuración, componentes, bloques, datos de lógica, bibliotecas y binarios.
+3. Identifica el paquete, nombre del proyecto, Activities, clases, IDs y referencias entre archivos cuando existan.
+4. Para el cambio solicitado, rastrea la cadena completa:
+   elemento visual → XML/definición → ID/clave → clase → método → listener/evento → acción → almacenamiento/persistencia.
+5. Busca referencias cruzadas en todo el proyecto. No modifiques solo una aparición si hay rutas de acceso compartidas o duplicadas.
+6. Distingue recursos definidos (`@string`, `@color`, `@id`, etc.) de textos directos y valores programáticos.
+7. Identifica si el proyecto tiene personalizaciones del fork, librerías locales, bloques personalizados y estructuras adicionales.
+8. Si se necesita consultar GitHub, busca primero el repositorio oficial Sketchware-Pro/Sketchware-Pro y verifica la rama/tag/commit compatible. La documentación pública del repositorio indica clases generales del generador, pero no presupongas que una clase del generador sea también la responsable del formato de backup.
+9. Si usas una bifurcación o herramienta comunitaria para entender el formato, identifícala como referencia secundaria y valida contra el archivo y la versión real.
+
+FASE 6 — PLAN DE CAMBIOS Y EDICIÓN
+
+Antes de editar, prepara un plan breve:
+   - comportamiento que pidió el usuario;
+   - archivos que realmente contienen ese comportamiento;
+   - dependencias y referencias afectadas;
+   - formato de datos que debe conservarse;
+   - pruebas necesarias.
+
+Edita solamente las rutas necesarias. Conserva nombres de métodos requeridos por el framework, IDs usados desde otras clases, serialización, referencias y compatibilidad. No reemplaces una clase completa si basta un parche puntual.
+
+Para Java/Kotlin/XML/JSON:
+   - conserva la codificación y el formato;
+   - valida sintaxis/XML/JSON después de guardar;
+   - no cambies las versiones de SDK/dependencias por conveniencia;
+   - no elimines código aparentemente muerto sin comprobar sus referencias;
+   - no renombres IDs, métodos de eventos o claves persistentes sin migración explícita.
+
+Si la solicitud es visual, verifica tanto el estado normal como estados de foco, error, selección, tema claro/oscuro y accesibilidad si aplican.
+Si la solicitud es de navegación, comprueba que el control ejecuta la acción real y abre la vista/actividad correcta.
+Si la solicitud afecta bloques, comprueba definición, parámetros, conexiones, serialización y generación de código; que el bloque aparezca en la paleta no basta.
+
+FASE 7 — REEMPAQUETADO CONSERVADOR
+
+Recomendación: no uses de forma automática `zip -qr -9` para todos los proyectos. Puede cambiar método, nivel, orden o metadatos y volver a comprimir todas las entradas. Primero inspecciona cómo estaba hecho el respaldo y qué requiere el importador.
+
+Si el contenedor es ZIP estándar y sus métodos son compatibles, vuelve a escribir el mismo conjunto de entradas, en el mismo orden, con los mismos nombres y métodos originales. Sustituye solo el contenido de archivos editados. Conserva comentario de archivo, fechas, comentarios y campos extra cuando sea posible. No alteres archivos no relacionados.
+
+Ejemplo de reempaquetado Python que conserva el método y los metadatos accesibles de cada entrada:
+
+```python
+from pathlib import Path
+from zipfile import ZipFile, ZipInfo, ZIP_STORED, ZIP_DEFLATED
+from copy import copy
+
+src = Path("proyecto_original.swb")
+dst = Path("proyecto_editado.swb")
+# Diccionario: ruta interna exacta -> bytes nuevos
+changed = {
+    # "ruta/interna/archivo.java": Path("workspace/ruta/interna/archivo.java").read_bytes(),
+}
+
+with ZipFile(src, "r") as zin:
+    if zin.testzip() is not None:
+        raise RuntimeError("El ZIP original tiene entradas dañadas")
+
+    supported = {ZIP_STORED, ZIP_DEFLATED}
+    for info in zin.infolist():
+        if info.compress_type not in supported:
+            raise RuntimeError(
+                f"Método ZIP {info.compress_type} no validado para {info.filename}"
+            )
+        if info.flag_bits & 0x1:
+            raise RuntimeError(
+                f"Entrada cifrada a nivel ZIP: {info.filename}; requiere tratamiento explícito"
+            )
+
+    with ZipFile(dst, "w", allowZip64=True) as zout:
+        zout.comment = zin.comment
+        for old_info in zin.infolist():
+            data = changed.get(old_info.filename)
+            if data is None:
+                data = zin.read(old_info.filename)
+
+            new_info = copy(old_info)
+            zout.writestr(
+                new_info,
+                data,
+                compress_type=old_info.compress_type,
+                compresslevel=6 if old_info.compress_type == ZIP_DEFLATED else None,
+            )
+
+with ZipFile(dst, "r") as check:
+    bad = check.testzip()
+    if bad is not None:
+        raise RuntimeError(f"Resultado ZIP dañado: {bad}")
+```
+
+Nota: el código conserva el método de cada entrada y la mayoría de metadatos expuestos por Python, pero al reescribir un ZIP se vuelven a generar los flujos comprimidos, CRC y tamaños. No promete conservar idénticos los bytes comprimidos, offsets o todos los campos internos del ZIP. Si el importador depende de particularidades no estándar, detente y usa la rutina de exportación oficial del fork.
+
+No conviertas entradas ZIP originales `STORED` en `DEFLATED`, o viceversa, salvo que esté justificado y se haya probado la importación.
+
+FASE 8 — VERIFICACIÓN DE CAMBIOS
+
+Compara el original y el resultado:
+   - mismas rutas y cantidad de entradas, salvo que el cambio requiera explícitamente añadir/quitar algo;
+   - entradas añadidas, eliminadas y renombradas;
+   - archivos cuyo contenido descomprimido cambió;
+   - tamaño original/final;
+   - métodos de compresión por entrada;
+   - CRC de todas las entradas;
+   - SHA-256 del archivo completo;
+   - validez del texto/XML/JSON y archivos de código modificados.
+
+Para comparar contenidos descomprimidos, lee por `ZipFile.read(nombre)` de ambos archivos. No compares solo el tamaño comprimido porque DEFLATE puede producir flujos distintos aunque el contenido original sea idéntico.
+
+Registra las diferencias en un informe. Si un archivo no debía cambiar, exige igualdad byte a byte de su contenido descomprimido.
+
+FASE 9 — PRUEBAS E IMPORTACIÓN
+
+Distingue claramente estos niveles:
+   A. Contenedor ZIP válido (`testzip` sin errores).
+   B. Estructura Sketchware reconocida (rutas/entradas esperadas y metadatos coherentes).
+   C. Formatos internos descifrados/serializados correctamente, cuando corresponda.
+   D. Importación real del `.swb` en la versión Sketchware Pro compatible.
+   E. Apertura del proyecto, edición del componente solicitado y compilación del APK.
+
+No afirmes D o E si no se ejecutaron. Si no hay dispositivo/Sketchware disponible, dilo y entrega el resultado con niveles A–C que sí se hayan verificado.
+
+FASE 10 — ENTREGA
+
+Entrega:
+   1. Archivo `.swb` final descargable.
+   2. Nombre del proyecto y versión/fork identificados, si se pudieron determinar.
+   3. Resumen del procedimiento de extracción y método de ZIP encontrado.
+   4. Si existe cifrado interno: archivos afectados y algoritmo solo cuando esté demostrado.
+   5. Lista exacta de archivos modificados.
+   6. IDs, claves, métodos y valores reales encontrados en ESTE proyecto, con valores anteriores/nuevos.
+   7. Entradas agregadas/eliminadas y comparación de integridad.
+   8. SHA-256, tamaño y método(s) ZIP final(es).
+   9. Pruebas realizadas y pruebas no realizadas.
+   10. Advertencias o riesgos pendientes.
+
+No incluyas una lista de clases, IDs o claves del proyecto anterior como requisitos. Si algún nombre sirve como ejemplo, márcalo expresamente como ejemplo no reutilizable.
+
+REFERENCIAS TÉCNICAS PARA CONSULTAR (VERIFICAR SIEMPRE LA VERSIÓN)
+
+- Repositorio oficial de Sketchware Pro: https://github.com/Sketchware-Pro/Sketchware-Pro
+- README y mapa de clases del repositorio oficial: https://github.com/Sketchware-Pro/Sketchware-Pro/blob/main/README.md
+- GitHub discussion que confirma que Sketchware Pro requiere backups SWB para importar proyectos: https://github.com/Sketchware-Pro/Sketchware-Pro/discussions/1109
+- Repositorio comunitario de herramienta de cifrado/descifrado de archivos de proyecto Sketchware. Su README advierte que los archivos internos cifrados deben editarse con cautela; es referencia secundaria, no especificación universal: https://github.com/Mahmoud-Magd/Sketchware-Encryptor-And-Decryptor
+- Proyecto comunitario Sketchware Desktop que declara importación/exportación SWB y menciona ficheros de proyecto cifrados. Es una implementación no oficial/en desarrollo y no sustituye al código de la versión objetivo: https://github.com/aiotv1/sketchware-desktop
+- ZIP / DEFLATE: RFC 1951 (DEFLATE): https://www.rfc-editor.org/rfc/rfc1951
+- Python zipfile: https://docs.python.org/3/library/zipfile.html
+
+INSTRUCCIÓN FINAL
+Cuando reciba el nuevo `.swb`, empieza por FASE 1. No empieces modificando clases ni aplicando valores del ejemplo anterior. Primero identifica el contenedor, los métodos ZIP, las rutas reales, el fork/versión y el formato de cada entrada. Después sigue todas las fases hasta entregar el respaldo reconstruido y su informe liego dmae el zip en nuevo completo en library.
+⋮⋮⋮⋮⋮⋮⋮⋮
